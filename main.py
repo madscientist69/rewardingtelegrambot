@@ -1,256 +1,239 @@
 import os
+import json
+import urllib.parse
 from fastapi import FastAPI, Request
 from telegram import Update, Bot
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
-from utils import load_db, save_db
+from telegram.ext import Application, CommandHandler, ContextTypes
 
+# -------------------- CONFIG ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_DOMAIN = os.getenv("WEBHOOK_DOMAIN")
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+
+if not BOT_TOKEN:
+    raise Exception("ENV BOT_TOKEN missing")
+if not WEBHOOK_DOMAIN:
+    raise Exception("ENV WEBHOOK_DOMAIN missing")
+
+ENCODED_TOKEN = urllib.parse.quote(BOT_TOKEN, safe="")
+WEBHOOK_PATH = f"/webhook/{ENCODED_TOKEN}"
 WEBHOOK_URL = WEBHOOK_DOMAIN + WEBHOOK_PATH
 
+# -------------------- FASTAPI ------------------------
 app = FastAPI()
 bot = Bot(BOT_TOKEN)
 application = Application.builder().token(BOT_TOKEN).build()
 
-# ------------------------
-#  LOAD DATABASE
-# ------------------------
-db = load_db()
+DB_FILE = "db.json"
 
-def ensure_user(uid):
-    if uid not in db["users"]:
-        db["users"][uid] = {
+# -------------------- DATABASE UTILS --------------------
+def load_db():
+    if not os.path.exists(DB_FILE):
+        with open(DB_FILE, "w") as f:
+            f.write("{}")
+    with open(DB_FILE, "r") as f:
+        return json.load(f)
+
+def save_db(data):
+    with open(DB_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+# -------------------- COMMANDS --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    db = load_db()
+
+    if str(user.id) not in db:
+        db[str(user.id)] = {
             "points": 0,
             "rewards": [],
-            "history": [],
-            "setup_rewards": False
+            "history": []
         }
         save_db(db)
 
-# ------------------------
-#  COMMANDS
-# ------------------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-
     await update.message.reply_text(
-        "👋 Selamat datang di Reward Bot!\n\n"
-        "Gunakan /help untuk melihat semua fitur."
+        "Selamat datang!\n"
+        "Silakan kirim daftar reward menggunakan /setrewards.\n"
+        "Format:\n"
+        "reward - poin\n"
+        "contoh:\n"
+        "Snack kecil - 3\n"
+        "BingXue - 9\n"
+        "Buku - 18"
     )
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📘 *Panduan Reward Bot*\n\n"
-        "/start - Mulai bot & inisiasi akun\n"
-        "/help - Menampilkan panduan\n"
-        "/setrewards - Buat daftar reward Anda\n"
-        "/rewards - Lihat daftar reward\n"
-        "/points - Lihat poin\n"
-        "/add <tugas> <poin> - Tambah poin dari tugas\n"
-        "/redeem <nomor> - Tukar poin dengan reward\n"
-        "/history - Lihat riwayat aktivitas\n\n"
-        "Format /setrewards:\n"
-        "3 Snack kecil\n"
-        "9 BingXue\n"
-        "18 Ebook\n"
-    )
-    await update.message.reply_markdown(text)
 
 
 async def setrewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-
-    db["users"][uid]["setup_rewards"] = True
-    save_db(db)
+    user = update.message.from_user
+    db = load_db()
 
     await update.message.reply_text(
-        "Silakan kirim _list reward_ Anda dalam satu pesan.\n"
-        "Format tiap baris:\n"
-        "<poin> <nama reward>\n\n"
-        "Contoh:\n"
-        "3 Snack kecil\n"
-        "9 BingXue\n"
-        "18 Ebook"
+        "Kirim daftar reward kamu.\n"
+        "Setiap baris = reward baru.\n"
+        "Format: Nama reward - poin"
     )
+
+    context.user_data["awaiting_rewards"] = True
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    text = update.message.text
+    db = load_db()
+
+    # Jika menunggu reward list
+    if context.user_data.get("awaiting_rewards"):
+        lines = text.strip().split("\n")
+        rewards = []
+
+        for line in lines:
+            if "-" not in line:
+                continue
+            name, pts = line.split("-", 1)
+            rewards.append({
+                "name": name.strip(),
+                "points": int(pts.strip())
+            })
+
+        db[str(user.id)]["rewards"] = rewards
+        save_db(db)
+
+        context.user_data["awaiting_rewards"] = False
+
+        return await update.message.reply_text("Reward list berhasil disimpan!")
 
 
 async def rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
+    user = update.message.from_user
+    db = load_db()
 
-    rewards = db["users"][uid]["rewards"]
-    if not rewards:
-        await update.message.reply_text("❌ Anda belum membuat reward. Gunakan /setrewards.")
-        return
+    user_data = db.get(str(user.id))
+    if not user_data or not user_data["rewards"]:
+        return await update.message.reply_text("Reward list kosong. Gunakan /setrewards")
 
-    text = "🎁 *Reward Anda:*\n\n"
-    for i, r in enumerate(rewards, start=1):
-        text += f"{i}. {r['points']} poin → {r['name']}\n"
+    msg = "🎁 *Reward kamu:*\n"
+    for i, r in enumerate(user_data["rewards"], start=1):
+        msg += f"{i}. {r['name']} — {r['points']} poin\n"
 
-    await update.message.reply_markdown(text)
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def points(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-
-    pts = db["users"][uid]["points"]
-    await update.message.reply_text(f"💰 Poin Anda: {pts}")
+    user = update.message.from_user
+    db = load_db()
+    pts = db[str(user.id)]["points"]
+    await update.message.reply_text(f"💰 Poin kamu: *{pts}*", parse_mode="Markdown")
 
 
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
+    user = update.message.from_user
+    db = load_db()
 
     if len(context.args) < 2:
-        await update.message.reply_text("Format: /add <nama tugas> <poin>")
-        return
+        return await update.message.reply_text("Format: /add <nama tugas> <poin>")
 
-    *task, pts = context.args
-    task = " ".join(task)
+    task_name = " ".join(context.args[:-1])
+    pts = int(context.args[-1])
 
-    try:
-        pts = int(pts)
-    except:
-        await update.message.reply_text("Poin harus angka.")
-        return
-
-    user = db["users"][uid]
-    user["points"] += pts
-    user["history"].append(f"+{pts} poin dari tugas: {task}")
-
+    db[str(user.id)]["points"] += pts
+    db[str(user.id)]["history"].append(
+        f"Selesai: {task_name} (+{pts})"
+    )
     save_db(db)
 
-    await update.message.reply_text(
-        f"✔️ '{task}' ditambahkan. Poin +{pts}.\n"
-        f"Total poin: {user['points']}"
-    )
-
-
-async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-
-    user = db["users"][uid]
-
-    if len(context.args) != 1:
-        await update.message.reply_text("Format: /redeem <nomor>")
-        return
-
-    try:
-        idx = int(context.args[0]) - 1
-    except:
-        await update.message.reply_text("Nomor reward tidak valid.")
-        return
-
-    if idx < 0 or idx >= len(user["rewards"]):
-        await update.message.reply_text("Nomor reward tidak ada.")
-        return
-
-    reward = user["rewards"][idx]
-
-    if user["points"] < reward["points"]:
-        await update.message.reply_text("❌ Poin tidak cukup.")
-        return
-
-    user["points"] -= reward["points"]
-    user["history"].append(f"-{reward['points']} poin untuk reward: {reward['name']}")
-    save_db(db)
-
-    await update.message.reply_text(
-        f"🎉 Anda berhasil redeem:\n{reward['name']} (−{reward['points']} poin)\n"
-        f"Poin tersisa: {user['points']}"
-    )
+    await update.message.reply_text(f"✔ Ditambahkan!\nTugas: {task_name}\nPoin: {pts}")
 
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
+    user = update.message.from_user
+    db = load_db()
 
-    hist = db["users"][uid]["history"]
+    hist = db[str(user.id)]["history"]
     if not hist:
-        await update.message.reply_text("📜 Belum ada riwayat.")
-        return
+        return await update.message.reply_text("History kosong.")
 
-    text = "📜 *Riwayat Anda:*\n\n"
+    msg = "📜 *History:*\n"
     for h in hist:
-        text += f"- {h}\n"
+        msg += f"- {h}\n"
 
-    await update.message.reply_markdown(text)
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-# ------------------------
-# TEXT HANDLER (SETREWARDS)
-# ------------------------
+async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    db = load_db()
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
+    if len(context.args) != 1:
+        return await update.message.reply_text("Format: /redeem <nomor reward>")
 
-    user = db["users"][uid]
+    idx = int(context.args[0]) - 1
+    user_data = db[str(user.id)]
+    rewards = user_data["rewards"]
 
-    if not user["setup_rewards"]:
-        return
+    if idx < 0 or idx >= len(rewards):
+        return await update.message.reply_text("Reward tidak ditemukan.")
 
-    lines = update.message.text.strip().split("\n")
-    new_rewards = []
+    reward = rewards[idx]
 
-    for line in lines:
-        parts = line.split(" ", 1)
-        if len(parts) != 2:
-            await update.message.reply_text("Format salah di salah satu baris.")
-            return
+    if user_data["points"] < reward["points"]:
+        return await update.message.reply_text("Poin tidak cukup.")
 
-        try:
-            pts = int(parts[0])
-        except:
-            await update.message.reply_text("Poin harus angka di setiap baris.")
-            return
+    user_data["points"] -= reward["points"]
+    user_data["history"].append(f"Redeem: {reward['name']} (-{reward['points']})")
 
-        new_rewards.append({"points": pts, "name": parts[1]})
-
-    user["rewards"] = new_rewards
-    user["setup_rewards"] = False
     save_db(db)
 
-    await update.message.reply_text("✔️ Reward berhasil disimpan!")
+    await update.message.reply_text(
+        f"🎉 Kamu mendapatkan reward:\n*{reward['name']}*",
+        parse_mode="Markdown"
+    )
 
 
-# ------------------------
-# REGISTER HANDLERS
-# ------------------------
+async def helpcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/start - mulai\n"
+        "/setrewards - isi daftar reward\n"
+        "/rewards - lihat reward\n"
+        "/points - lihat poin\n"
+        "/add <tugas> <poin> - tambah poin\n"
+        "/history - riwayat\n"
+        "/redeem <no> - tukarkan reward\n"
+    )
+
+# -------------------- REGISTER HANDLERS --------------------
 application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", help_cmd))
 application.add_handler(CommandHandler("setrewards", setrewards))
 application.add_handler(CommandHandler("rewards", rewards))
 application.add_handler(CommandHandler("points", points))
 application.add_handler(CommandHandler("add", add))
+application.add_handler(CommandHandler("history", history))
 application.add_handler(CommandHandler("redeem", redeem))
+application.add_handler(CommandHandler("help", helpcmd))
+
+application.add_handler(CommandHandler("setrewards", setrewards))
+application.add_handler(CommandHandler("history", history))
+application.add_handler(CommandHandler("help", helpcmd))
+
+application.add_handler(CommandHandler("help", helpcmd))
 application.add_handler(CommandHandler("history", history))
 
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+# Handler untuk menangkap text biasa
+from telegram.ext import MessageHandler, filters
+application.add_handler(MessageHandler(filters.TEXT, message_handler))
 
 
-# ------------------------
-# WEBHOOK FASTAPI
-# ------------------------
+# -------------------- STARTUP - SET WEBHOOK --------------------
 @app.on_event("startup")
 async def startup():
     await bot.initialize()
     await application.initialize()
     await bot.set_webhook(WEBHOOK_URL)
-    print("Webhook set:", WEBHOOK_URL)
+    print("Webhook aktif di:", WEBHOOK_URL)
 
+
+# -------------------- WEBHOOK RECEIVER --------------------
 @app.post(WEBHOOK_PATH)
-async def webhook(req: Request):
-    data = await req.json()
+async def webhook(request: Request):
+    data = await request.json()
     update = Update.de_json(data, bot)
     await application.process_update(update)
     return {"ok": True}
